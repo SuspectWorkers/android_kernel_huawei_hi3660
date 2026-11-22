@@ -93,7 +93,17 @@
 #include "xfrm.h"
 #include "netlabel.h"
 #include "audit.h"
+#ifdef CONFIG_KSU_SUSFS
+#include <linux/susfs_def.h>
+#endif // #ifdef CONFIG_KSU_SUSFS
 #include "avc_ss.h"
+
+#ifdef CONFIG_KSU_SUSFS
+extern bool ksu_selinux_hide_running __read_mostly;
+extern int susfs_security_context_to_sid(const char *scontext, u32 scontext_len, u32 *sid, gfp_t gfp);
+extern int susfs_security_context_to_sid_force(const char *scontext, u32 scontext_len, u32 *sid);
+extern int my_setprocattr(struct task_struct *p, char *name, void *value, size_t size);
+#endif // #ifdef CONFIG_KSU_SUSFS
 
 #define SELINUX_POOL_ALIGNMENT_ORDER	4
 #define SELINUX_POOL_PREALLOC_SIZE_BYTES (4 * 1024 * 1024)
@@ -3251,6 +3261,120 @@ static void selinux_inode_post_setxattr(struct dentry *dentry, const char *name,
 	return;
 }
 
+#ifdef CONFIG_KSU_SUSFS
+static int susfs_selinux_inode_setxattr(struct dentry *dentry, const char *name,
+				  const void *value, size_t size, int flags)
+{
+	struct inode *inode = d_backing_inode(dentry);
+	struct inode_security_struct *isec;
+	struct superblock_security_struct *sbsec;
+	struct common_audit_data ad;
+	u32 newsid, sid = current_sid();
+	int rc = 0;
+
+	if (strcmp(name, XATTR_NAME_SELINUX))
+		return selinux_inode_setotherxattr(dentry, name);
+
+	sbsec = inode->i_sb->s_security;
+	if (!(sbsec->flags & SBLABEL_MNT))
+		return -EOPNOTSUPP;
+
+	if (!inode_owner_or_capable(inode))
+		return -EPERM;
+
+	ad.type = LSM_AUDIT_DATA_DENTRY;
+	ad.u.dentry = dentry;
+
+	isec = backing_inode_security(dentry);
+	rc = avc_has_perm(sid, isec->sid, isec->sclass, FILE__RELABELFROM, &ad);
+	if (rc)
+		return rc;
+
+	rc = susfs_security_context_to_sid(value, size, &newsid, GFP_KERNEL);
+	if (rc == -EINVAL) {
+		if (!capable(CAP_MAC_ADMIN)) {
+			struct audit_buffer *ab;
+			size_t audit_size;
+			const char *str;
+
+			if (value) {
+				str = value;
+				if (str[size - 1] == '\0')
+					audit_size = size - 1;
+				else
+					audit_size = size;
+			} else {
+				str = "";
+				audit_size = 0;
+			}
+			ab = audit_log_start(current->audit_context, GFP_ATOMIC, AUDIT_SELINUX_ERR);
+			audit_log_format(ab, "op=setxattr invalid_context=");
+			audit_log_n_untrustedstring(ab, value, audit_size);
+			audit_log_end(ab);
+			return rc;
+		}
+		rc = susfs_security_context_to_sid_force(value, size, &newsid);
+	}
+	if (rc)
+		return rc;
+
+	rc = avc_has_perm(sid, newsid, isec->sclass, FILE__RELABELTO, &ad);
+	if (rc)
+		return rc;
+
+	rc = security_validate_transition(isec->sid, newsid, sid, isec->sclass);
+	if (rc)
+		return rc;
+
+	return avc_has_perm(newsid, sbsec->sid, SECCLASS_FILESYSTEM, FILESYSTEM__ASSOCIATE, &ad);
+}
+
+static void susfs_selinux_inode_post_setxattr(struct dentry *dentry, const char *name,
+					const void *value, size_t size, int flags)
+{
+	struct inode *inode = d_backing_inode(dentry);
+	struct inode_security_struct *isec;
+	u32 newsid;
+	int rc;
+
+	if (strcmp(name, XATTR_NAME_SELINUX))
+		return;
+
+	rc = susfs_security_context_to_sid_force(value, size, &newsid);
+	if (rc) {
+		printk(KERN_ERR "SELinux:  unable to map context to SID"
+		       "for (%s, %lu), rc=%d\n",
+		       inode->i_sb->s_id, inode->i_ino, -rc);
+		return;
+	}
+
+	isec = backing_inode_security(dentry);
+	spin_lock(&isec->lock);
+	isec->sclass = inode_mode_to_security_class(inode->i_mode);
+	isec->sid = newsid;
+	isec->initialized = LABEL_INITIALIZED;
+	spin_unlock(&isec->lock);
+}
+
+static int handle_selinux_inode_setxattr(struct dentry *dentry, const char *name,
+				  const void *value, size_t size, int flags)
+{
+	if (likely(current_uid().val >= 10000 && ksu_selinux_hide_running))
+		return susfs_selinux_inode_setxattr(dentry, name, value, size, flags);
+	return selinux_inode_setxattr(dentry, name, value, size, flags);
+}
+
+static void handle_selinux_inode_post_setxattr(struct dentry *dentry, const char *name,
+					const void *value, size_t size, int flags)
+{
+	if (likely(current_uid().val >= 10000 && ksu_selinux_hide_running)) {
+		susfs_selinux_inode_post_setxattr(dentry, name, value, size, flags);
+		return;
+	}
+	selinux_inode_post_setxattr(dentry, name, value, size, flags);
+}
+#endif // #ifdef CONFIG_KSU_SUSFS
+
 static int selinux_inode_getxattr(struct dentry *dentry, const char *name)
 {
 	const struct cred *cred = current_cred();
@@ -5070,6 +5194,18 @@ static int selinux_nlmsg_perm(struct sock *sk, struct sk_buff *skb)
 
 		rc = selinux_nlmsg_lookup(sclass, nlh->nlmsg_type, &perm);
 		if (rc == 0) {
+#ifdef CONFIG_KSU_SUSFS
+			if (unlikely(current_uid().val >= 10000 && ksu_selinux_hide_running &&
+				     (perm == NETLINK_ROUTE_SOCKET__NLMSG_READPRIV ||
+				      perm == NETLINK_ROUTE_SOCKET__NLMSG_GETNEIGH))) {
+				struct av_decision avd;
+				if (sksec->sid != SECINITSID_KERNEL &&
+				    avc_has_perm_noaudit(task_sid(current), sksec->sid,
+							 sksec->sclass, perm,
+							 AVC_STRICT, &avd))
+					return -EACCES;
+			}
+#endif
 			rc = sock_has_perm(current, sk, perm);
 			if (rc)
 				return rc;
@@ -6041,6 +6177,74 @@ abort_change:
 	return error;
 }
 
+#ifdef CONFIG_KSU_SUSFS
+static int susfs_selinux_setprocattr_current(struct task_struct *p, void *value, size_t size)
+{
+	struct task_security_struct *tsec;
+	struct cred *new;
+	u32 sid = 0, ptsid;
+	int error;
+	char *str = value;
+
+	error = current_has_perm(p, PROCESS__SETCURRENT);
+	if (error)
+		return error;
+
+	if (size && str[0] && str[0] != '\n') {
+		if (str[size - 1] == '\n') {
+			str[size - 1] = 0;
+			size--;
+		}
+		error = susfs_security_context_to_sid(value, size, &sid, GFP_KERNEL);
+		if (error)
+			return error;
+	}
+
+	new = prepare_creds();
+	if (!new)
+		return -ENOMEM;
+
+	tsec = new->security;
+	error = -EINVAL;
+	if (sid == 0)
+		goto susfs_abort_change;
+
+	error = -EPERM;
+	if (!current_is_single_threaded()) {
+		error = security_bounded_transition(tsec->sid, sid);
+		if (error)
+			goto susfs_abort_change;
+	}
+
+	error = avc_has_perm(tsec->sid, sid, SECCLASS_PROCESS, PROCESS__DYNTRANSITION, NULL);
+	if (error)
+		goto susfs_abort_change;
+
+	ptsid = ptrace_parent_sid(p);
+	if (ptsid != 0) {
+		error = avc_has_perm(ptsid, sid, SECCLASS_PROCESS, PROCESS__PTRACE, NULL);
+		if (error)
+			goto susfs_abort_change;
+	}
+
+	tsec->sid = sid;
+	commit_creds(new);
+	return size;
+
+susfs_abort_change:
+	abort_creds(new);
+	return error;
+}
+
+static int handle_selinux_setprocattr(struct task_struct *p, char *name, void *value, size_t size)
+{
+	if (current == p && likely(!strcmp(name, "current") &&
+				current_uid().val >= 10000 && ksu_selinux_hide_running))
+		return my_setprocattr(p, name, value, size);
+	return selinux_setprocattr(p, name, value, size);
+}
+#endif // #ifdef CONFIG_KSU_SUSFS
+
 static int selinux_ismaclabel(const char *name)
 {
 	return (strcmp(name, XATTR_SELINUX_SUFFIX) == 0);
@@ -6355,8 +6559,13 @@ static struct security_hook_list selinux_hooks[] = {
 	LSM_HOOK_INIT(inode_permission, selinux_inode_permission),
 	LSM_HOOK_INIT(inode_setattr, selinux_inode_setattr),
 	LSM_HOOK_INIT(inode_getattr, selinux_inode_getattr),
+#ifdef CONFIG_KSU_SUSFS
+	LSM_HOOK_INIT(inode_setxattr, handle_selinux_inode_setxattr),
+	LSM_HOOK_INIT(inode_post_setxattr, handle_selinux_inode_post_setxattr),
+#else
 	LSM_HOOK_INIT(inode_setxattr, selinux_inode_setxattr),
 	LSM_HOOK_INIT(inode_post_setxattr, selinux_inode_post_setxattr),
+#endif // #ifdef CONFIG_KSU_SUSFS
 	LSM_HOOK_INIT(inode_getxattr, selinux_inode_getxattr),
 	LSM_HOOK_INIT(inode_listxattr, selinux_inode_listxattr),
 	LSM_HOOK_INIT(inode_removexattr, selinux_inode_removexattr),
@@ -6434,7 +6643,11 @@ static struct security_hook_list selinux_hooks[] = {
 	LSM_HOOK_INIT(d_instantiate, selinux_d_instantiate),
 
 	LSM_HOOK_INIT(getprocattr, selinux_getprocattr),
+#ifdef CONFIG_KSU_SUSFS
+	LSM_HOOK_INIT(setprocattr, handle_selinux_setprocattr),
+#else
 	LSM_HOOK_INIT(setprocattr, selinux_setprocattr),
+#endif // #ifdef CONFIG_KSU_SUSFS
 
 	LSM_HOOK_INIT(ismaclabel, selinux_ismaclabel),
 	LSM_HOOK_INIT(secid_to_secctx, selinux_secid_to_secctx),

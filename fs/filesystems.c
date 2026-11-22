@@ -15,6 +15,10 @@
 #include <linux/module.h>
 #include <linux/slab.h>
 #include <asm/uaccess.h>
+#ifdef CONFIG_KSU_SUSFS
+#include <linux/cred.h>
+extern bool ksu_selinux_hide_running __read_mostly;
+#endif
 
 /*
  * Handling of filesystem drivers list.
@@ -227,6 +231,13 @@ static int filesystems_proc_show(struct seq_file *m, void *v)
 	read_lock(&file_systems_lock);
 	tmp = file_systems;
 	while (tmp) {
+#ifdef CONFIG_KSU_SUSFS
+		if (unlikely(current_uid().val >= 10000 && ksu_selinux_hide_running &&
+			     strcmp(tmp->name, "overlay") == 0)) {
+			tmp = tmp->next;
+			continue;
+		}
+#endif
 		seq_printf(m, "%s\t%s\n",
 			(tmp->fs_flags & FS_REQUIRES_DEV) ? "" : "nodev",
 			tmp->name);

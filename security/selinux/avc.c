@@ -31,10 +31,19 @@
 #include <linux/ipv6.h>
 #include <net/ipv6.h>
 #include <chipset_common/hiview_selinux/hiview_selinux.h>
+#ifdef CONFIG_KSU_SUSFS
+#include <linux/susfs_def.h>
+#endif // #ifdef CONFIG_KSU_SUSFS
 #include "avc.h"
 #include "avc_ss.h"
 #include "classmap.h"
 #include "objsec.h"
+
+#ifdef CONFIG_KSU_SUSFS
+extern u32 susfs_ksu_sid;
+extern u32 susfs_priv_app_sid;
+extern struct static_key_false susfs_is_avc_log_spoofing_enabled;
+#endif // #ifdef CONFIG_KSU_SUSFS
 
 #define AVC_CACHE_SLOTS			512
 #define AVC_DEF_CACHE_THRESHOLD		512
@@ -159,6 +168,19 @@ static void avc_dump_query(struct audit_buffer *ab, u32 ssid, u32 tsid, u16 tcla
 		kfree(scontext);
 	}
 
+#ifdef CONFIG_KSU_SUSFS
+	if (static_branch_likely(&susfs_is_avc_log_spoofing_enabled) && unlikely(tsid == susfs_ksu_sid)) {
+		rc = security_sid_to_context(tsid, &scontext, &scontext_len);
+		if (rc)
+			audit_log_format(ab, " tsid=%d", susfs_priv_app_sid);
+		else {
+			kfree(scontext);
+			audit_log_format(ab, " tcontext=%s", "u:r:priv_app:s0:c512,c768");
+		}
+		goto susfs_skip_tcontext;
+	}
+#endif // #ifdef CONFIG_KSU_SUSFS
+
 	rc = security_sid_to_context(tsid, &scontext, &scontext_len);
 	if (rc)
 		audit_log_format(ab, " tsid=%d", tsid);
@@ -167,6 +189,9 @@ static void avc_dump_query(struct audit_buffer *ab, u32 ssid, u32 tsid, u16 tcla
 		kfree(scontext);
 	}
 
+#ifdef CONFIG_KSU_SUSFS
+susfs_skip_tcontext:
+#endif // #ifdef CONFIG_KSU_SUSFS
 	BUG_ON(!tclass || tclass >= ARRAY_SIZE(secclass_map));
 	audit_log_format(ab, " tclass=%s", secclass_map[tclass-1].name);
 }

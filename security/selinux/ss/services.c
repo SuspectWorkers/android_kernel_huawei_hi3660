@@ -66,8 +66,16 @@
 #include "objsec.h"
 #include "netlabel.h"
 #include "xfrm.h"
+#ifdef CONFIG_KSU_SUSFS
+#include <linux/susfs_def.h>
+#endif // #ifdef CONFIG_KSU_SUSFS
 #include "ebitmap.h"
 #include "audit.h"
+
+#ifdef CONFIG_KSU_SUSFS
+extern bool susfs_is_sus_type_rcu(u32 type_value);
+extern void susfs_spoof_avd_allowed_rcu(u32 s_type, u32 t_type, u32 c_type, u32 *avd_allowed);
+#endif // #ifdef CONFIG_KSU_SUSFS
 
 int selinux_android_netlink_route;
 int selinux_android_netlink_getneigh;
@@ -1168,6 +1176,53 @@ allow:
 	goto out;
 }
 
+#ifdef CONFIG_KSU_SUSFS
+void susfs_security_compute_av_user(u32 ssid,
+			      u32 tsid,
+			      u16 tclass,
+			      struct av_decision *avd)
+{
+	struct context *scontext = NULL, *tcontext = NULL;
+
+	read_lock(&policy_rwlock);
+	avd_init(avd);
+	if (!*ss_initialized)
+		goto allow;
+
+	scontext = sidtab_search(&sidtab, ssid);
+	if (!scontext) {
+		printk(KERN_ERR "SELinux: %s:  unrecognized SID %d\n",
+		       __func__, ssid);
+		goto out;
+	}
+
+	if (ebitmap_get_bit(&policydb.permissive_map, scontext->type))
+		avd->flags |= AVD_FLAGS_PERMISSIVE;
+
+	tcontext = sidtab_search(&sidtab, tsid);
+	if (!tcontext) {
+		printk(KERN_ERR "SELinux: %s:  unrecognized SID %d\n",
+		       __func__, tsid);
+		goto out;
+	}
+
+	if (unlikely(!tclass)) {
+		if (policydb.allow_unknown)
+			goto allow;
+		goto out;
+	}
+
+	context_struct_compute_av(scontext, tcontext, tclass, avd, NULL);
+	susfs_spoof_avd_allowed_rcu(scontext->type, tcontext->type, tclass, &avd->allowed);
+ out:
+	read_unlock(&policy_rwlock);
+	return;
+allow:
+	avd->allowed = 0xffffffff;
+	goto out;
+}
+#endif // #ifdef CONFIG_KSU_SUSFS
+
 /*
  * Write the security context string representation of
  * the context structure `context' into a dynamically
@@ -1389,6 +1444,156 @@ out:
 		context_destroy(ctx);
 	return rc;
 }
+
+#ifdef CONFIG_KSU_SUSFS
+/*
+ * Same as string_to_context_struct(), except that a context whose type
+ * resolves to a susfs "sus" type is rejected (-EINVAL), so apps cannot use
+ * /sys/fs/selinux/context to confirm that such a type exists in policy.
+ */
+static int susfs_string_to_context_struct(struct policydb *pol,
+				    struct sidtab *sidtabp,
+				    char *scontext,
+				    u32 scontext_len,
+				    struct context *ctx,
+				    u32 def_sid)
+{
+	struct role_datum *role;
+	struct type_datum *typdatum;
+	struct user_datum *usrdatum;
+	char *scontextp, *p, oldc;
+	int rc = 0;
+
+	context_init(ctx);
+
+	rc = -EINVAL;
+	scontextp = (char *) scontext;
+
+	p = scontextp;
+	while (*p && *p != ':')
+		p++;
+	if (*p == 0)
+		goto out;
+	*p++ = 0;
+
+	usrdatum = hashtab_search(pol->p_users.table, scontextp);
+	if (!usrdatum)
+		goto out;
+	ctx->user = usrdatum->value;
+
+	scontextp = p;
+	while (*p && *p != ':')
+		p++;
+	if (*p == 0)
+		goto out;
+	*p++ = 0;
+
+	role = hashtab_search(pol->p_roles.table, scontextp);
+	if (!role)
+		goto out;
+	ctx->role = role->value;
+
+	scontextp = p;
+	while (*p && *p != ':')
+		p++;
+	oldc = *p;
+	*p++ = 0;
+
+	typdatum = hashtab_search(pol->p_types.table, scontextp);
+	if (!typdatum || typdatum->attribute)
+		goto out;
+
+	if (unlikely(susfs_is_sus_type_rcu(typdatum->value)))
+		goto out;
+
+	ctx->type = typdatum->value;
+
+	rc = mls_context_to_sid(pol, oldc, &p, ctx, sidtabp, def_sid);
+	if (rc)
+		goto out;
+
+	rc = -EINVAL;
+	if ((p - scontext) < scontext_len)
+		goto out;
+
+	if (!policydb_context_isvalid(pol, ctx))
+		goto out;
+	rc = 0;
+out:
+	if (rc)
+		context_destroy(ctx);
+	return rc;
+}
+
+static int susfs_security_context_to_sid_core(const char *scontext, u32 scontext_len,
+					u32 *sid, u32 def_sid, gfp_t gfp_flags, int force)
+{
+	char *scontext2, *str = NULL;
+	struct context context;
+	int rc = 0;
+
+	if (!scontext_len)
+		return -EINVAL;
+
+	scontext2 = kmemdup_nul(scontext, scontext_len, gfp_flags);
+	if (!scontext2)
+		return -ENOMEM;
+
+	if (!*ss_initialized) {
+		int i;
+
+		for (i = 1; i < SECINITSID_NUM; i++) {
+			if (!strcmp(initial_sid_to_string[i], scontext2)) {
+				*sid = i;
+				goto out;
+			}
+		}
+		*sid = SECINITSID_KERNEL;
+		goto out;
+	}
+	*sid = SECSID_NULL;
+
+	if (force) {
+		rc = -ENOMEM;
+		str = kstrdup(scontext2, gfp_flags);
+		if (!str)
+			goto out;
+	}
+
+	read_lock(&policy_rwlock);
+	rc = susfs_string_to_context_struct(&policydb, &sidtab, scontext2,
+				      scontext_len, &context, def_sid);
+	if (rc == -EINVAL && force) {
+		context.str = str;
+		context.len = strlen(str) + 1;
+		str = NULL;
+	} else if (rc)
+		goto out_unlock;
+	rc = sidtab_context_to_sid(&sidtab, &context, sid);
+	context_destroy(&context);
+out_unlock:
+	read_unlock(&policy_rwlock);
+out:
+	kfree(scontext2);
+	kfree(str);
+	return rc;
+}
+
+int susfs_security_context_to_sid(const char *scontext, u32 scontext_len, u32 *sid, gfp_t gfp)
+{
+	return susfs_security_context_to_sid_core(scontext, scontext_len, sid, SECSID_NULL, gfp, 0);
+}
+
+int susfs_security_context_to_sid_force(const char *scontext, u32 scontext_len, u32 *sid)
+{
+	return susfs_security_context_to_sid_core(scontext, scontext_len, sid, SECSID_NULL, GFP_KERNEL, 1);
+}
+
+int susfs_security_context_str_to_sid(const char *scontext, u32 *sid, gfp_t gfp)
+{
+	return susfs_security_context_to_sid(scontext, strlen(scontext), sid, gfp);
+}
+#endif // #ifdef CONFIG_KSU_SUSFS
 
 static int security_context_to_sid_core(const char *scontext, u32 scontext_len,
 					u32 *sid, u32 def_sid, gfp_t gfp_flags,

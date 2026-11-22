@@ -42,12 +42,12 @@ EXPORT_SYMBOL_GPL(init_uts_ns);
 
 /* FIXED STRINGS! Don't touch! */
 const char linux_banner[] =
-	"Linux version " UTS_RELEASE " (" LINUX_COMPILE_BY "@"
+	"Linux version " UTS_RELEASE " (" LINUX_COMPILE_BY " "
 	LINUX_COMPILE_HOST ") (" LINUX_COMPILER ") " UTS_VERSION "\n";
 
 const char linux_proc_banner[] =
 	"%s version %s"
-	" (" LINUX_COMPILE_BY "@" LINUX_COMPILE_HOST ")"
+	" (" LINUX_COMPILE_BY " " LINUX_COMPILE_HOST ")"
 	" (" LINUX_COMPILER ") %s\n";
 
 /* UTV_VERSION fomat: "#1 SMP PREEMPT Wed Jun 15 20:21:27 CST 2016"

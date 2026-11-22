@@ -17,6 +17,11 @@
 
 #ifdef CONFIG_PROC_SYSCTL
 
+#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME
+extern struct static_key_false susfs_is_uname_spoof_buffer_set;
+extern void susfs_spoof_uname(struct new_utsname *tmp);
+#endif // #ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME
+
 static void *get_uts(struct ctl_table *table)
 {
 	char *which = table->data;
@@ -51,6 +56,22 @@ static int proc_do_uts_string(struct ctl_table *table, int write,
 	down_read(&uts_sem);
 	memcpy(tmp_data, get_uts(table), sizeof(tmp_data));
 	up_read(&uts_sem);
+
+#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME
+	if (!write && static_branch_likely(&susfs_is_uname_spoof_buffer_set) &&
+	    (table->data == init_uts_ns.name.release ||
+	     table->data == init_uts_ns.name.version)) {
+		struct new_utsname spoofed;
+
+		memcpy(&spoofed, &init_uts_ns.name, sizeof(spoofed));
+		susfs_spoof_uname(&spoofed);
+		memcpy(tmp_data,
+		       table->data == init_uts_ns.name.release ?
+				spoofed.release : spoofed.version,
+		       sizeof(tmp_data));
+	}
+#endif // #ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME
+
 	r = proc_dostring(&uts_table, write, buffer, lenp, ppos);
 
 	if (write) {

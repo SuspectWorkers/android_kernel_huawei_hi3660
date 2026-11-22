@@ -34,6 +34,9 @@
 #include <linux/fsnotify.h>
 #include <linux/lockdep.h>
 #include <linux/user_namespace.h>
+#ifdef CONFIG_KSU_SUSFS
+#include <linux/susfs_def.h>
+#endif // #ifdef CONFIG_KSU_SUSFS
 #include "internal.h"
 
 
@@ -922,10 +925,42 @@ static DEFINE_SPINLOCK(unnamed_dev_lock);/* protects the above */
  */
 static int unnamed_dev_start = 1;
 
+#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+extern bool susfs_is_current_ksu_domain(void);
+extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;
+#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+
 int get_anon_bdev(dev_t *p)
 {
 	int dev;
 	int error;
+
+#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+	if (static_branch_unlikely(&susfs_is_sdcard_android_data_not_decrypted)) {
+		if (susfs_is_current_ksu_domain()) {
+			/* sus dev numbers live above DEFAULT_KSU_MNT_MINOR_DEV, unnamed_dev_start is left alone */
+			int ret;
+retry_ksu:
+			if (ida_pre_get(&unnamed_dev_ida, GFP_ATOMIC) == 0)
+				return -ENOMEM;
+			spin_lock(&unnamed_dev_lock);
+			ret = ida_get_new_above(&unnamed_dev_ida, DEFAULT_KSU_MNT_MINOR_DEV, &dev);
+			spin_unlock(&unnamed_dev_lock);
+			if (ret == -EAGAIN)
+				goto retry_ksu;
+			else if (ret)
+				return -EAGAIN;
+			if (dev >= (1 << MINORBITS)) {
+				spin_lock(&unnamed_dev_lock);
+				ida_remove(&unnamed_dev_ida, dev);
+				spin_unlock(&unnamed_dev_lock);
+				return -EMFILE;
+			}
+			*p = MKDEV(0, dev & MINORMASK);
+			return 0;
+		}
+	}
+#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
 
  retry:
 	if (ida_pre_get(&unnamed_dev_ida, GFP_ATOMIC) == 0)
@@ -1285,6 +1320,11 @@ int __sb_start_write(struct super_block *sb, int level, bool wait)
 	return 1;
 }
 EXPORT_SYMBOL(__sb_start_write);
+
+#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+extern bool susfs_is_current_ksu_domain(void);
+extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;
+#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
 
 /**
  * sb_wait_write - wait until all writers to given file system finish

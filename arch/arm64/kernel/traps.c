@@ -45,6 +45,7 @@
 #include <asm/exception.h>
 #include <asm/system_misc.h>
 #include <asm/sysreg.h>
+#include <clocksource/arm_arch_timer.h>
 
 #ifdef CONFIG_HISI_BB
 #include <linux/hisi/rdr_hisi_platform.h>
@@ -546,8 +547,10 @@ static void cntfrq_read_handler(unsigned int esr, struct pt_regs *regs)
 {
 	int rt = (esr & ESR_ELx_SYS64_ISS_RT_MASK) >> ESR_ELx_SYS64_ISS_RT_SHIFT;
 
-	if (rt != 31)
-		regs->regs[rt] = read_sysreg(cntfrq_el0);
+	if (rt != 31) {
+		u32 rate = arch_timer_get_rate();
+		regs->regs[rt] = rate ? rate : read_sysreg(cntfrq_el0);
+	}
 	regs->pc += 4;
 }
 

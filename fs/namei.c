@@ -40,8 +40,20 @@
 #include <asm/uaccess.h>
 #include <linux/hisi/hisi_hkip.h>
 
+#ifdef CONFIG_KSU_SUSFS
+#include <linux/susfs_def.h>
+#endif // #ifdef CONFIG_KSU_SUSFS
+
 #include "internal.h"
 #include "mount.h"
+
+#ifdef CONFIG_KSU_SUSFS_SUS_PATH
+extern __attribute__((hot)) bool susfs_is_inode_sus_path(struct inode *inode);
+#endif // #ifdef CONFIG_KSU_SUSFS_SUS_PATH
+#ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT
+extern struct filename *susfs_open_redirect_spoof_do_sys_openat(struct inode *inode);
+extern int susfs_open_redirect_spoof_vfs_readlink(struct inode *inode, char __user *buffer, int buflen);
+#endif // #ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT
 
 /* [Feb-1997 T. Schoebel-Theuer]
  * Fundamental changes in the pathname lookup mechanisms (namei)
@@ -1811,6 +1823,22 @@ static inline int should_follow_link(struct nameidata *nd, struct path *link,
 
 enum {WALK_GET = 1, WALK_PUT = 2};
 
+#ifdef CONFIG_KSU_SUSFS_SUS_PATH
+/*
+ * 4.9 backport: hide sus paths from non-allowed app processes during the walk.
+ * In RCU mode the path is not refcounted, otherwise drop it.
+ */
+static inline bool susfs_nd_hide_sus_path(struct nameidata *nd, struct path *path,
+					  struct inode *inode)
+{
+	if (likely(!inode) || likely(!susfs_is_inode_sus_path(inode)))
+		return false;
+	if (!(nd->flags & LOOKUP_RCU))
+		path_put(path);
+	return true;
+}
+#endif // #ifdef CONFIG_KSU_SUSFS_SUS_PATH
+
 static int walk_component(struct nameidata *nd, int flags)
 {
 	struct path path;
@@ -1851,6 +1879,10 @@ static int walk_component(struct nameidata *nd, int flags)
 		inode = d_backing_inode(path.dentry);
 	}
 
+#ifdef CONFIG_KSU_SUSFS_SUS_PATH
+	if (susfs_nd_hide_sus_path(nd, &path, inode))
+		return -ENOENT;
+#endif // #ifdef CONFIG_KSU_SUSFS_SUS_PATH
 	if (flags & WALK_PUT)
 		put_link(nd);
 	err = should_follow_link(nd, &path, flags & WALK_GET, inode, seq);
@@ -2353,7 +2385,7 @@ static int path_lookupat(struct nameidata *nd, unsigned flags, struct path *path
 	return err;
 }
 
-static int filename_lookup(int dfd, struct filename *name, unsigned flags,
+int filename_lookup(int dfd, struct filename *name, unsigned flags,
 			   struct path *path, struct path *root)
 {
 	int retval;
@@ -3424,6 +3456,10 @@ static int do_last(struct nameidata *nd,
 	seq = 0;	/* out of RCU mode, so the value doesn't matter */
 	inode = d_backing_inode(path.dentry);
 finish_lookup:
+#ifdef CONFIG_KSU_SUSFS_SUS_PATH
+	if (susfs_nd_hide_sus_path(nd, &path, inode))
+		return -ENOENT;
+#endif // #ifdef CONFIG_KSU_SUSFS_SUS_PATH
 	if (nd->depth)
 		put_link(nd);
 	error = should_follow_link(nd, &path, nd->flags & LOOKUP_FOLLOW,
@@ -3439,6 +3475,26 @@ finish_open:
 	error = complete_walk(nd);
 	if (error)
 		return error;
+#ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT
+	if (nd->path.dentry->d_inode &&
+	    SUSFS_IS_INODE_OPEN_REDIRECT_WITHOUT_UID_CHECK(nd->path.dentry->d_inode)) {
+		struct filename *fake_filename =
+			susfs_open_redirect_spoof_do_sys_openat(nd->path.dentry->d_inode);
+
+		if (fake_filename && !IS_ERR(fake_filename)) {
+			struct path fake_path;
+
+			/* filename_lookup() consumes fake_filename */
+			error = filename_lookup(AT_FDCWD, fake_filename, LOOKUP_FOLLOW,
+						&fake_path, NULL);
+			if (unlikely(error))
+				return error;
+			path_put(&nd->path);
+			nd->path = fake_path;
+			nd->inode = d_backing_inode(fake_path.dentry);
+		}
+	}
+#endif // #ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT
 	audit_inode(nd->name, nd->path.dentry, 0);
 	if (open_flag & O_CREAT) {
 		error = -EISDIR;
@@ -4802,6 +4858,15 @@ int generic_readlink(struct dentry *dentry, char __user *buffer, int buflen)
 		if (IS_ERR(link))
 			return PTR_ERR(link);
 	}
+#ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT
+	if (SUSFS_IS_INODE_OPEN_REDIRECT(inode)) {
+		res = susfs_open_redirect_spoof_vfs_readlink(inode, buffer, buflen);
+		if (!res) {
+			do_delayed_call(&done);
+			return res;
+		}
+	}
+#endif // #ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT
 	res = readlink_copy(buffer, buflen, link);
 	do_delayed_call(&done);
 	return res;
