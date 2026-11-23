@@ -2397,6 +2397,10 @@ proc_map_files_readdir(struct file *file, struct dir_context *ctx)
 		}
 		for (i = 0, vma = mm->mmap, pos = 2; vma;
 				vma = vma->vm_next) {
+#ifdef CONFIG_KSU_SUSFS_SUS_MAP
+			if (vma->vm_file && SUSFS_IS_INODE_SUS_MAP(file_inode(vma->vm_file)))
+				continue;
+#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MAP
 			if (!vma->vm_file)
 				continue;
 			if (++pos <= ctx->pos)
